@@ -416,35 +416,69 @@ async function collectAllFormats(
   const adaptiveAudio: StreamCandidate[] = [];
   const hlsManifests: Array<{ clientKey: string; priority: number; url: string }> = [];
 
-  for (const client of CLIENTS) {
-    try {
-      const resp = await fetchPlayerResponse(videoId, client, apiKey, visitorData);
-      if (!resp) continue;
+  // Fire all client requests in parallel — same approach as Kotlin coroutines
+  const results = await Promise.allSettled(
+    CLIENTS.map(client => fetchPlayerResponse(videoId, client, apiKey, visitorData)
+      .then(resp => ({ client, resp }))
+    )
+  );
 
-      const status = resp.playabilityStatus?.status;
-      if (status && status !== 'OK' && status !== 'CONTENT_CHECK_REQUIRED') {
-        logger.warn('YouTubeExtractor', `[${client.key}] status=${status} reason=${resp.playabilityStatus?.reason ?? ''}`);
-        continue;
-      }
+  for (const result of results) {
+    if (result.status === 'rejected') {
+      logger.warn('YouTubeExtractor', `Client request rejected:`, result.reason);
+      continue;
+    }
 
-      const sd = resp.streamingData;
-      if (!sd) continue;
+    const { client, resp } = result.value;
+    if (!resp) continue;
 
-      if (sd.hlsManifestUrl) {
-        hlsManifests.push({ clientKey: client.key, priority: client.priority, url: sd.hlsManifestUrl });
-      }
+    const status = resp.playabilityStatus?.status;
+    if (status && status !== 'OK' && status !== 'CONTENT_CHECK_REQUIRED') {
+      logger.warn('YouTubeExtractor', `[${client.key}] status=${status} reason=${resp.playabilityStatus?.reason ?? ''}`);
+      continue;
+    }
 
-      let nProg = 0, nVid = 0, nAud = 0;
+    const sd = resp.streamingData;
+    if (!sd) continue;
 
-      // Progressive (muxed) formats — matching Kotlin: skip non-video mimeTypes
-      for (const f of (sd.formats ?? [])) {
-        if (!f.url) continue;
-        const mimeBase = getMimeBase(f.mimeType);
-        if (f.mimeType && !mimeBase.startsWith('video/')) continue;
+    if (sd.hlsManifestUrl) {
+      hlsManifests.push({ clientKey: client.key, priority: client.priority, url: sd.hlsManifestUrl });
+    }
+
+    let nProg = 0, nVid = 0, nAud = 0;
+
+    // Progressive (muxed) formats — matching Kotlin: skip non-video mimeTypes
+    for (const f of (sd.formats ?? [])) {
+      if (!f.url) continue;
+      const mimeBase = getMimeBase(f.mimeType);
+      if (f.mimeType && !mimeBase.startsWith('video/')) continue;
+      const height = f.height ?? parseQualityLabel(f.qualityLabel);
+      const fps = f.fps ?? 0;
+      const bitrate = f.bitrate ?? f.averageBitrate ?? 0;
+      progressive.push({
+        client: client.key,
+        priority: client.priority,
+        url: f.url,
+        score: videoScore(height, fps, bitrate),
+        height,
+        fps,
+        ext: getExt(f.mimeType),
+        bitrate,
+        mimeType: f.mimeType ?? '',
+      });
+      nProg++;
+    }
+
+    // Adaptive formats
+    for (const f of (sd.adaptiveFormats ?? [])) {
+      if (!f.url) continue;
+      const mimeBase = getMimeBase(f.mimeType);
+
+      if (mimeBase.startsWith('video/')) {
         const height = f.height ?? parseQualityLabel(f.qualityLabel);
         const fps = f.fps ?? 0;
         const bitrate = f.bitrate ?? f.averageBitrate ?? 0;
-        progressive.push({
+        adaptiveVideo.push({
           client: client.key,
           priority: client.priority,
           url: f.url,
@@ -455,53 +489,27 @@ async function collectAllFormats(
           bitrate,
           mimeType: f.mimeType ?? '',
         });
-        nProg++;
+        nVid++;
+      } else if (mimeBase.startsWith('audio/')) {
+        const bitrate = f.bitrate ?? f.averageBitrate ?? 0;
+        const sampleRate = parseFloat(f.audioSampleRate ?? '0') || 0;
+        adaptiveAudio.push({
+          client: client.key,
+          priority: client.priority,
+          url: f.url,
+          score: audioScore(bitrate, sampleRate),
+          height: 0,
+          fps: 0,
+          ext: getExt(f.mimeType),
+          bitrate,
+          audioSampleRate: f.audioSampleRate,
+          mimeType: f.mimeType ?? '',
+        });
+        nAud++;
       }
-
-      // Adaptive formats
-      for (const f of (sd.adaptiveFormats ?? [])) {
-        if (!f.url) continue;
-        const mimeBase = getMimeBase(f.mimeType);
-
-        if (mimeBase.startsWith('video/')) {
-          const height = f.height ?? parseQualityLabel(f.qualityLabel);
-          const fps = f.fps ?? 0;
-          const bitrate = f.bitrate ?? f.averageBitrate ?? 0;
-          adaptiveVideo.push({
-            client: client.key,
-            priority: client.priority,
-            url: f.url,
-            score: videoScore(height, fps, bitrate),
-            height,
-            fps,
-            ext: getExt(f.mimeType),
-            bitrate,
-            mimeType: f.mimeType ?? '',
-          });
-          nVid++;
-        } else if (mimeBase.startsWith('audio/')) {
-          const bitrate = f.bitrate ?? f.averageBitrate ?? 0;
-          const sampleRate = parseFloat(f.audioSampleRate ?? '0') || 0;
-          adaptiveAudio.push({
-            client: client.key,
-            priority: client.priority,
-            url: f.url,
-            score: audioScore(bitrate, sampleRate),
-            height: 0,
-            fps: 0,
-            ext: getExt(f.mimeType),
-            bitrate,
-            audioSampleRate: f.audioSampleRate,
-            mimeType: f.mimeType ?? '',
-          });
-          nAud++;
-        }
-      }
-
-      logger.info('YouTubeExtractor', `[${client.key}] progressive=${nProg} video=${nVid} audio=${nAud} hls=${sd.hlsManifestUrl ? 1 : 0}`);
-    } catch (err) {
-      logger.warn('YouTubeExtractor', `[${client.key}] Failed:`, err);
     }
+
+    logger.info('YouTubeExtractor', `[${client.key}] progressive=${nProg} video=${nVid} audio=${nAud} hls=${sd.hlsManifestUrl ? 1 : 0}`);
   }
 
   return { progressive, adaptiveVideo, adaptiveAudio, hlsManifests };
