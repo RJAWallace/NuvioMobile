@@ -108,6 +108,10 @@ export type RemoteSyncStats = {
 };
 
 type PushTarget = 'plugins' | 'addons' | 'watch_progress' | 'library' | 'watched_items';
+type SupabaseRequestError = Error & {
+  status?: number;
+  code?: string;
+};
 
 class SupabaseSyncService {
   private static instance: SupabaseSyncService;
@@ -766,6 +770,12 @@ class SupabaseSyncService {
     await mmkvStorage.setItem(SUPABASE_SESSION_KEY, JSON.stringify(session));
   }
 
+  private async clearLocalSession(): Promise<void> {
+    this.session = null;
+    this.watchProgressPushedSignatures.clear();
+    await mmkvStorage.removeItem(SUPABASE_SESSION_KEY);
+  }
+
   private isSessionExpired(session: SupabaseSession): boolean {
     if (!session.expires_at) return false;
     const now = Math.floor(Date.now() / 1000);
@@ -790,10 +800,12 @@ class SupabaseSyncService {
       await this.setSession(refreshed);
       return true;
     } catch (error) {
-      logger.error('[SupabaseSyncService] Failed to refresh session:', error);
-      this.session = null;
-      this.watchProgressPushedSignatures.clear();
-      await mmkvStorage.removeItem(SUPABASE_SESSION_KEY);
+      if (this.shouldInvalidateSessionOnRefreshFailure(error)) {
+        logger.error('[SupabaseSyncService] Failed to refresh session; clearing invalid session:', error);
+        await this.clearLocalSession();
+      } else {
+        logger.warn('[SupabaseSyncService] Failed to refresh session; keeping stored session for retry:', error);
+      }
       return false;
     }
   }
@@ -807,10 +819,12 @@ class SupabaseSyncService {
         const refreshed = await this.refreshSession(this.session.refresh_token);
         await this.setSession(refreshed);
       } catch (error) {
-        logger.error('[SupabaseSyncService] Token refresh failed:', error);
-        this.session = null;
-        this.watchProgressPushedSignatures.clear();
-        await mmkvStorage.removeItem(SUPABASE_SESSION_KEY);
+        if (this.shouldInvalidateSessionOnRefreshFailure(error)) {
+          logger.error('[SupabaseSyncService] Token refresh failed; clearing invalid session:', error);
+          await this.clearLocalSession();
+        } else {
+          logger.warn('[SupabaseSyncService] Token refresh failed; keeping stored session for retry:', error);
+        }
         return null;
       }
     }
@@ -874,6 +888,11 @@ class SupabaseSyncService {
   }
 
   private buildRequestError(status: number, parsed: unknown, raw: string): Error {
+    const code =
+      parsed && typeof parsed === 'object'
+        ? ((parsed as any).error_code || (parsed as any).code || (parsed as any).error)?.toString()
+        : undefined;
+
     if (parsed && typeof parsed === 'object') {
       const message =
         (parsed as any).message ||
@@ -881,13 +900,48 @@ class SupabaseSyncService {
         (parsed as any).error_description ||
         (parsed as any).error;
       if (typeof message === 'string' && message.trim().length > 0) {
-        return new Error(message);
+        const error = new Error(message) as SupabaseRequestError;
+        error.status = status;
+        error.code = code;
+        return error;
       }
     }
     if (raw && raw.trim().length > 0) {
-      return new Error(raw);
+      const error = new Error(raw) as SupabaseRequestError;
+      error.status = status;
+      error.code = code;
+      return error;
     }
-    return new Error(`Supabase request failed with status ${status}`);
+    const error = new Error(`Supabase request failed with status ${status}`) as SupabaseRequestError;
+    error.status = status;
+    error.code = code;
+    return error;
+  }
+
+  private shouldInvalidateSessionOnRefreshFailure(error: unknown): boolean {
+    const requestError = error as SupabaseRequestError | undefined;
+    const status = requestError?.status;
+    const code = (requestError?.code || '').toLowerCase();
+    const message = error instanceof Error ? error.message.toLowerCase() : '';
+
+    if (status !== undefined && [400, 401, 403, 422].includes(status)) {
+      return true;
+    }
+
+    if (['invalid_grant', 'refresh_token_not_found', 'session_not_found'].includes(code)) {
+      return true;
+    }
+
+    if (!message.includes('refresh token')) {
+      return false;
+    }
+
+    return (
+      message.includes('invalid') ||
+      message.includes('not found') ||
+      message.includes('expired') ||
+      message.includes('revoked')
+    );
   }
 
   private extractErrorMessage(error: unknown, fallback: string): string {
